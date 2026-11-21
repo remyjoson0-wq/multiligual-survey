@@ -14,6 +14,8 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', S
 DEMO=os.getenv('DEMO_MODE','0')=='1'
 REGISTRATION_OPEN = os.getenv('REGISTRATION_OPEN', '0') == '1'
 TASKS_OPEN = os.getenv('TASKS_OPEN', '0') == '1'
+MANUAL_PAYMENT_ENABLED = os.getenv('MANUAL_PAYMENT_ENABLED', '0') == '1'
+USDT_TRC20_ADDRESS = os.getenv('USDT_TRC20_ADDRESS', '')
 
 class CursorAdapter:
  def __init__(self, cursor, lastrowid=None):
@@ -71,6 +73,8 @@ def init():
   """CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, admin INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 0, balance BIGINT NOT NULL DEFAULT 0 CHECK (balance>=0), referral_code TEXT UNIQUE, referred_by BIGINT REFERENCES users(id))""",
   """CREATE TABLE IF NOT EXISTS surveys(id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, description TEXT, reward BIGINT NOT NULL CHECK (reward>0), questions TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0, budget BIGINT NOT NULL DEFAULT 0 CHECK (budget>=0))""",
   """CREATE TABLE IF NOT EXISTS responses(id BIGSERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(id), survey_id BIGINT REFERENCES surveys(id), answers TEXT NOT NULL, reward BIGINT NOT NULL, UNIQUE(user_id,survey_id))""",
+  """CREATE TABLE IF NOT EXISTS manual_activations(id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id), txid TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ, reviewed_by BIGINT REFERENCES users(id))""",
+  """CREATE UNIQUE INDEX IF NOT EXISTS one_pending_manual_activation_per_user ON manual_activations(user_id) WHERE status='pending'""",
   """CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, user_id BIGINT REFERENCES users(id), provider_id TEXT UNIQUE, address TEXT, amount TEXT, status TEXT DEFAULT 'waiting', created_at TIMESTAMPTZ DEFAULT NOW())""",
   """CREATE TABLE IF NOT EXISTS withdrawals(id BIGSERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(id), amount BIGINT NOT NULL, address TEXT NOT NULL, status TEXT DEFAULT 'pending', tx TEXT UNIQUE)""",
   """CREATE TABLE IF NOT EXISTS referral_awards(id BIGSERIAL PRIMARY KEY, referrer_id BIGINT NOT NULL REFERENCES users(id), referred_id BIGINT NOT NULL UNIQUE REFERENCES users(id), amount BIGINT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""",
@@ -95,7 +99,7 @@ def prepare():
  g.user=db().execute('SELECT * FROM users WHERE id=?',(session.get('uid'),)).fetchone(); session.setdefault('csrf',secrets.token_hex(24))
  if request.method=='POST' and request.endpoint!='webhook' and not secrets.compare_digest(request.form.get('csrf',''),session['csrf']): abort(400)
 @app.context_processor
-def context(): return dict(demo=DEMO,csrf=session.get('csrf'),money=lambda n:f'{n/100:.2f}')
+def context(): return dict(demo=DEMO,csrf=session.get('csrf'),money=lambda n:f'{n/100:.2f}',registration_open=REGISTRATION_OPEN,tasks_open=TASKS_OPEN)
 def auth(admin=False,active=False):
  def deco(fn):
   @wraps(fn)
@@ -138,43 +142,52 @@ def login():
 def logout():session.clear();return redirect('/')
 def api(method,path,**kwargs):
  r=requests.request(method,'https://api.nowpayments.io/v1/'+path,headers={'x-api-key':os.environ['NOWPAYMENTS_API_KEY']},timeout=15,**kwargs);r.raise_for_status();return r.json()
-@app.route('/membership',methods=['GET','POST'])
+@app.route('/membership', methods=['GET','POST'])
 @auth()
 def membership():
  if g.user['active']:return redirect(url_for('dashboard'))
- d=db(); p=d.execute('SELECT * FROM payments WHERE user_id=? ORDER BY created_at DESC LIMIT 1',(g.user['id'],)).fetchone()
+ d=db()
  if request.method=='POST':
-  if DEMO:
-   d.execute('UPDATE users SET active=1 WHERE id=?',(g.user['id'],));d.commit();return redirect(url_for('dashboard'))
-  if not os.getenv('LIVE_PAYMENTS')=='1':flash('Real payments are currently disabled.');return redirect(url_for('membership'))
-  if not p or p['status'] in ('expired','failed'):
-   try:
-    order=secrets.token_hex(16); data=api('POST','payment',json={'price_amount':10,'price_currency':'usd','pay_currency':'usdttrc20','order_id':order,'order_description':'Membership access, no guaranteed earnings','is_fixed_rate':True,'ipn_callback_url':os.environ['PUBLIC_URL'].rstrip('/')+'/webhook'})
-    d.execute('INSERT INTO payments(id,user_id,provider_id,address,amount) VALUES(?,?,?,?,?)',(order,g.user['id'],str(data['payment_id']),data['pay_address'],str(data['pay_amount'])));d.commit()
-   except (requests.RequestException,KeyError,ValueError):flash('Payment service unavailable. No payment instruction was created.')
-  elif p['provider_id']:
-   try: verify(p['provider_id'])
-   except (requests.RequestException,KeyError,ValueError):flash('Verification unavailable. Try again later.')
+  if not MANUAL_PAYMENT_ENABLED:
+   flash('Manual activation is not accepting payment submissions yet.');return redirect(url_for('membership'))
+  if not re.fullmatch(r'T[1-9A-HJ-NP-Za-km-z]{33}',USDT_TRC20_ADDRESS):
+   flash('Payment address is not configured; do not send funds.');return redirect(url_for('membership'))
+  txid=request.form.get('txid','').strip().lower()
+  if not re.fullmatch(r'[a-f0-9]{64}',txid):
+   flash('Enter a 64-character TRON transaction hash.');return redirect(url_for('membership'))
+  try:
+   d.execute('INSERT INTO manual_activations(user_id,txid) VALUES(?,?)',(g.user['id'],txid));d.commit()
+   flash('Transaction submitted for review. Access is enabled only after verification.')
+  except psycopg.IntegrityError:
+   d.rollback();flash('Transaction already used or your payment is already awaiting review.')
   return redirect(url_for('membership'))
- return render_template('page.html',page='membership',payment=p)
-def verify(pid):
- d=db(); p=d.execute('SELECT * FROM payments WHERE provider_id=?',(str(pid),)).fetchone()
- if not p:return
- data=api('GET','payment/'+str(pid)); status=data.get('payment_status','waiting')
- if str(data.get('payment_id'))!=p['provider_id'] or data.get('order_id')!=p['id'] or data.get('pay_currency')!='usdttrc20':return
- if status=='finished' and Decimal(str(data.get('actually_paid') or 0))>=Decimal(p['amount']):
-  d.execute('UPDATE users SET active=1 WHERE id=?',(p['user_id'],));d.execute("UPDATE payments SET status='finished' WHERE id=?",(p['id'],))
- elif status!='finished':d.execute("UPDATE payments SET status=? WHERE id=? AND status!='finished'",(status,p['id']))
- d.commit()
-@app.post('/webhook')
-def webhook():
- if DEMO or os.getenv('LIVE_PAYMENTS')!='1':abort(404)
- # Notification is only a hint; authoritative status is fetched directly using merchant API credentials.
- data=request.get_json(silent=True) or {}; pid=str(data.get('payment_id',''))
- if not pid.isdigit():abort(400)
- try:verify(pid)
- except (requests.RequestException,KeyError,ValueError):return 'retry',503
- return 'ok'
+ pending=d.execute('SELECT * FROM manual_activations WHERE user_id=? ORDER BY id DESC LIMIT 1',(g.user['id'],)).fetchone()
+ return render_template('page.html',page='membership_manual',manual_payment_enabled=MANUAL_PAYMENT_ENABLED,receiving_address=USDT_TRC20_ADDRESS if MANUAL_PAYMENT_ENABLED else '',manual_payment=pending)
+
+@app.post('/admin/manual-activation/<int:id>/<action>')
+@auth(admin=True)
+def review_manual_activation(id,action):
+ if action not in ('approve','reject'): abort(404)
+ if not MANUAL_PAYMENT_ENABLED: abort(403)
+ if action=='approve' and request.form.get('verified')!='yes':
+  flash('Verify the on-chain payment and confirm before approval.');return redirect(url_for('admin'))
+ d=db();d.execute('BEGIN')
+ item=d.execute('SELECT * FROM manual_activations WHERE id=? FOR UPDATE',(id,)).fetchone()
+ if not item or item['status']!='pending':
+  d.rollback();flash('This request was already reviewed.');return redirect(url_for('admin'))
+ if action=='approve':
+  # This checkbox is only admin attestation. Verification must be completed on TRONSCAN first.
+  d.execute("UPDATE manual_activations SET status='approved', reviewed_at=NOW(), reviewed_by=? WHERE id=?",(g.user['id'],id))
+  d.execute('UPDATE users SET active=1 WHERE id=?',(item['user_id'],))
+  flash('Activation approved after your on-chain verification.')
+ else:
+  d.execute("UPDATE manual_activations SET status='rejected', reviewed_at=NOW(), reviewed_by=? WHERE id=?",(g.user['id'],id))
+  flash('Payment submission rejected.')
+ d.commit();return redirect(url_for('admin'))
+
+@app.get('/terms')
+def terms():return render_template('page.html',page='terms')
+
 @app.route('/dashboard')
 @auth(active=True)
 def dashboard():
@@ -223,7 +236,7 @@ def admin():
    d.execute('INSERT INTO surveys(title,description,reward,questions,published,budget) VALUES(?,?,?,?,?,?)',(title,request.form['description'],reward,json.dumps(qs),1,budget));d.commit();flash('Survey published.')
   except (ValueError,ArithmeticError,AssertionError):flash('Check survey details and funded reward budget.')
   return redirect(url_for('admin'))
- return render_template('page.html',page='admin',referral_budget=d.execute('SELECT referral_budget FROM site_funds WHERE id=1').fetchone()['referral_budget'],referral_awards=d.execute('SELECT ra.*,u.name AS new_member,rf.email AS referrer FROM referral_awards ra JOIN users u ON ra.referred_id=u.id JOIN users rf ON ra.referrer_id=rf.id ORDER BY ra.id DESC').fetchall(),surveys=d.execute('SELECT * FROM surveys').fetchall(),users=d.execute('SELECT id,name,email,active,balance FROM users WHERE admin=0').fetchall(),withdrawals=d.execute('SELECT w.*,u.email FROM withdrawals w JOIN users u ON u.id=w.user_id').fetchall(),responses=d.execute('SELECT r.*,s.title,u.email FROM responses r JOIN surveys s ON s.id=r.survey_id JOIN users u ON u.id=r.user_id').fetchall())
+ return render_template('page.html',page='admin',referral_budget=d.execute('SELECT referral_budget FROM site_funds WHERE id=1').fetchone()['referral_budget'],referral_awards=d.execute('SELECT ra.*,u.name AS new_member,rf.email AS referrer FROM referral_awards ra JOIN users u ON ra.referred_id=u.id JOIN users rf ON ra.referrer_id=rf.id ORDER BY ra.id DESC').fetchall(),surveys=d.execute('SELECT * FROM surveys').fetchall(),users=d.execute('SELECT id,name,email,active,balance FROM users WHERE admin=0').fetchall(),withdrawals=d.execute('SELECT w.*,u.email FROM withdrawals w JOIN users u ON u.id=w.user_id').fetchall(),responses=d.execute('SELECT r.*,s.title,u.email FROM responses r JOIN surveys s ON s.id=r.survey_id JOIN users u ON u.id=r.user_id').fetchall(), manual_activations=d.execute("SELECT m.*,u.email FROM manual_activations m JOIN users u ON u.id=m.user_id ORDER BY m.id DESC LIMIT 100").fetchall(), receiving_address=USDT_TRC20_ADDRESS)
 @app.post('/admin/referrals/fund')
 @auth(admin=True)
 def fund_referrals():
